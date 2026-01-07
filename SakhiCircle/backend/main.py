@@ -18,9 +18,11 @@ import matplotlib.pyplot as plt
 import shap
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
+from gtts import gTTS
 
 # ============================================================
 # FastAPI App Initialization
@@ -107,6 +109,12 @@ class PredictionInput(BaseModel):
     savings: float = Field(..., ge=100, le=5000, description="Savings per member (INR)")
     attendance: float = Field(..., ge=0, le=100, description="Attendance rate (%)")
     repayment: float = Field(..., ge=0, le=100, description="Loan repayment rate (%)")
+
+
+class TTSRequest(BaseModel):
+    """Request model for text-to-speech."""
+    text: str
+    lang: str = "en"
 
 class PredictionResponse(BaseModel):
     """Response schema for credit score prediction."""
@@ -326,6 +334,23 @@ async def get_prediction_logs(limit: int = 10):
         return {"logs": logs, "count": len(logs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts")
+async def tts_endpoint(request: TTSRequest):
+    """Generate speech audio (MP3) for provided text using gTTS."""
+    text = (request.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required for TTS")
+
+    try:
+        buffer = BytesIO()
+        tts = gTTS(text=text, lang=request.lang)
+        tts.write_to_fp(buffer)
+        buffer.seek(0)
+        return StreamingResponse(buffer, media_type="audio/mpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {e}")
 
 # ============================================================
 # Run with Uvicorn

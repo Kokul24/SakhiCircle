@@ -1,6 +1,6 @@
 import { Shield, TrendingUp, Loader2, Sparkles, CheckCircle2, AlertTriangle } from 'lucide-react';
 
-function ScoreCard({ result, loading, formData }) {
+function ScoreCard({ result, loading, formData, strings = {} }) {
   const getStrokeDashoffset = (score) => {
     const circumference = 2 * Math.PI * 70;
     return circumference - (score / 100) * circumference;
@@ -38,16 +38,14 @@ function ScoreCard({ result, loading, formData }) {
       <div className="glass rounded-2xl p-8 hover-lift">
         <div className="flex items-center gap-3 mb-6">
           <Shield className="h-6 w-6 text-blue-400" />
-          <h3 className="text-lg font-bold text-white">Credit Score Result</h3>
+          <h3 className="text-lg font-bold text-white">{strings.credit_score_result || 'Credit Score Result'}</h3>
         </div>
         <div className="text-center py-12">
           <div className="w-32 h-32 mx-auto mb-6 rounded-full glass-light flex items-center justify-center animate-float">
             <TrendingUp className="h-16 w-16 text-slate-600" />
           </div>
           <p className="text-slate-400">
-            Adjust your SHG metrics and click{' '}
-            <span className="font-semibold gradient-text">"Calculate Score"</span>
-            {' '}to see results
+            {strings.adjust_metrics || 'Adjust your SHG metrics and click "Calculate Score" to see results'}
           </p>
         </div>
       </div>
@@ -59,7 +57,7 @@ function ScoreCard({ result, loading, formData }) {
       <div className="glass rounded-2xl p-8">
         <div className="flex items-center gap-3 mb-6">
           <Shield className="h-6 w-6 text-blue-400" />
-          <h3 className="text-lg font-bold text-white">Credit Score Result</h3>
+          <h3 className="text-lg font-bold text-white">{strings.credit_score_result || 'Credit Score Result'}</h3>
         </div>
         <div className="text-center py-12">
           <div className="w-32 h-32 mx-auto mb-6 loading-shimmer rounded-full" />
@@ -67,7 +65,7 @@ function ScoreCard({ result, loading, formData }) {
           <div className="h-4 w-32 mx-auto loading-shimmer rounded-lg" />
           <p className="text-slate-400 mt-4 flex items-center justify-center gap-2">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Analyzing with AI...
+            {strings.analyzing || 'Analyzing with AI...'}
           </p>
         </div>
       </div>
@@ -83,9 +81,9 @@ function ScoreCard({ result, loading, formData }) {
         <div className="flex items-center gap-3">
           <Shield className="h-6 w-6 text-blue-400" />
           <div>
-            <h3 className="text-lg font-bold text-white">Credit Score Result</h3>
+            <h3 className="text-lg font-bold text-white">{strings.credit_score_result || 'Credit Score Result'}</h3>
             <p className="text-xs text-slate-400">
-              Calculated at {new Date(result.timestamp).toLocaleTimeString()}
+              {strings.calculated_at || 'Calculated at'} {new Date(result.timestamp).toLocaleTimeString()}
             </p>
           </div>
         </div>
@@ -125,9 +123,9 @@ function ScoreCard({ result, loading, formData }) {
             </defs>
           </svg>
           <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <p className="text-5xl font-bold text-white mb-1">{result.score}</p>
-            <p className="text-sm text-slate-400">out of 100</p>
-          </div>
+              <p className="text-5xl font-bold text-white mb-1">{result.score}</p>
+              <p className="text-sm text-slate-400">out of 100</p>
+            </div>
         </div>
       </div>
 
@@ -139,9 +137,9 @@ function ScoreCard({ result, loading, formData }) {
           <AlertTriangle className={`h-5 w-5 ${colors.text}`} />
         )}
         <span className={`font-bold ${colors.text}`}>
-          {result.score >= 80 ? 'Excellent Credit' :
-           result.score >= 60 ? 'Good Credit' :
-           result.score >= 40 ? 'Fair Credit' : 'Needs Improvement'}
+          {result.score >= 80 ? (strings.excellent_credit || 'Excellent Credit') :
+           result.score >= 60 ? (strings.good_credit || 'Good Credit') :
+           result.score >= 40 ? (strings.fair_credit || 'Fair Credit') : (strings.needs_improvement || 'Needs Improvement')}
         </span>
       </div>
 
@@ -194,15 +192,15 @@ function ScoreCard({ result, loading, formData }) {
       <div className="mt-6 pt-6 border-t border-slate-700/50">
         <div className="grid grid-cols-3 gap-4 text-center">
           <div className="glass-light p-3 rounded-xl">
-            <p className="text-xs text-slate-400 mb-1">Savings</p>
+            <p className="text-xs text-slate-400 mb-1">{strings.savings || 'Savings'}</p>
             <p className="text-lg font-bold text-white">₹{formData.savings}</p>
           </div>
           <div className="glass-light p-3 rounded-xl">
-            <p className="text-xs text-slate-400 mb-1">Attendance</p>
+            <p className="text-xs text-slate-400 mb-1">{strings.attendance || 'Attendance'}</p>
             <p className="text-lg font-bold text-white">{formData.attendance}%</p>
           </div>
           <div className="glass-light p-3 rounded-xl">
-            <p className="text-xs text-slate-400 mb-1">Repayment</p>
+            <p className="text-xs text-slate-400 mb-1">{strings.repayment || 'Repayment'}</p>
             <p className="text-lg font-bold text-white">{formData.repayment}%</p>
           </div>
         </div>
