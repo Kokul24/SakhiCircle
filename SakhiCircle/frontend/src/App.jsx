@@ -43,6 +43,12 @@ function App() {
   const [lang, setLang] = useState('en');
   const audioCacheRef = useRef(new Map());
   const audioRef = useRef(null);
+  const [recording, setRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const [conversation, setConversation] = useState([]); // {speaker: 'user'|'system', text}
+  const [processingSTT, setProcessingSTT] = useState(false);
+  const [detectedLang, setDetectedLang] = useState(null);
+  const [pendingAction, setPendingAction] = useState(null);
 
   const fetchAndPlay = async (text) => {
     if (!text) return;
@@ -73,6 +79,166 @@ function App() {
     } catch (err) {
       console.error('TTS error', err);
     }
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Prefer Opus in webm if available for best compatibility with Whisper/ffmpeg
+      const preferred = 'audio/webm;codecs=opus';
+      const fallback = 'audio/webm';
+      const mimeType = (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(preferred)) ? preferred : fallback;
+      console.log('Using media mimeType:', mimeType);
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      const chunks = [];
+
+      mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mimeType });
+        console.log('Recorded blob size', blob.size, 'type', blob.type);
+        await handleAudioBlob(blob);
+        // stop tracks
+        stream.getTracks().forEach(t => t.stop());
+      };
+
+      mediaRecorder.start();
+      mediaRecorderRef.current = mediaRecorder;
+      setRecording(true);
+    } catch (err) {
+      console.error('Microphone access denied', err);
+      setRecording(false);
+    }
+  };
+
+  const stopRecording = () => {
+    try {
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== 'inactive') mr.stop();
+    } catch (e) {
+      console.error(e);
+    }
+    setRecording(false);
+  };
+
+  const handleAudioBlob = async (blob) => {
+    try {
+      setProcessingSTT(true);
+      const fd = new FormData();
+      // pick extension from blob type
+      const ext = blob.type.includes('wav') ? 'wav' : blob.type.includes('webm') ? 'webm' : 'dat';
+      const filename = `speech.${ext}`;
+      console.log('Uploading', filename, 'size', blob.size, 'type', blob.type);
+      fd.append('file', blob, filename);
+      // allow 'auto' so backend can detect language
+      fd.append('lang', lang || 'auto');
+
+      const resp = await fetch(`${API_URL}/stt`, { method: 'POST', body: fd });
+      if (!resp.ok) {
+        console.error('STT failed');
+        return;
+      }
+      const data = await resp.json();
+      const text = data.text || '';
+      const detected = data.detected_lang || null;
+      setDetectedLang(detected);
+      if (detected) {
+        setConversation(prev => [...prev, { speaker: 'system', text: `Detected language: ${detected}` }]);
+      }
+      console.log('STT response text:', text);
+      if (text) {
+        setConversation(prev => [...prev, { speaker: 'user', text }]);
+
+        // send to converse endpoint; prefer detected language from STT when available
+        const fd2 = new FormData();
+        fd2.append('text', text);
+        fd2.append('lang', detected || lang || 'auto');
+        fd2.append('savings', formData.savings);
+        fd2.append('attendance', formData.attendance);
+        fd2.append('repayment', formData.repayment);
+
+        const resp2 = await fetch(`${API_URL}/converse`, { method: 'POST', body: fd2 });
+        if (!resp2.ok) return;
+        const convo = await resp2.json();
+        const reply = convo.reply || 'OK';
+
+        // Handle actions
+        if (convo.action === 'set_field') {
+          // Ask user to confirm before applying potentially destructive updates
+          setPendingAction({ convo, reply });
+          setConversation(prev => [...prev, { speaker: 'system', text: `Detected intent: ${reply} — please confirm.` }]);
+          fetchAndPlay(`Detected intent: ${reply}. Please confirm.`);
+        } else {
+          // Handle navigation action
+          if (convo.action === 'navigate') {
+            const target = convo.target;
+            if (target) {
+              setNavItems(prev => prev.map(i => ({ ...i, active: i.key === target })));
+              setSidebarOpen(true);
+            }
+            setConversation(prev => [...prev, { speaker: 'system', text: reply }]);
+            fetchAndPlay(reply);
+
+          } else if (convo.action === 'show_logs') {
+            setConversation(prev => [...prev, { speaker: 'system', text: reply }]);
+            // fetch logs and append summary
+            try {
+              const r = await fetch(`${API_URL}/logs`);
+              const data = await r.json();
+              const logs = data.logs || [];
+              if (logs.length === 0) {
+                setConversation(prev => [...prev, { speaker: 'system', text: 'No logs found.' }]);
+                fetchAndPlay('No logs found.');
+              } else {
+                const summary = logs.slice(0,5).map(l => `Score ${l.score} • ${l.risk}`).join('\n');
+                setConversation(prev => [...prev, { speaker: 'system', text: summary }]);
+                fetchAndPlay(summary);
+              }
+            } catch (err) {
+              console.error('Failed to fetch logs', err);
+            }
+
+          } else {
+            setConversation(prev => [...prev, { speaker: 'system', text: reply }]);
+
+            // If backend asks to predict, fetch full prediction
+            if (convo.action === 'predict') {
+              try {
+                const r = await axios.post(`${API_URL}/predict`, formData, { headers: { 'Content-Type': 'application/json' } });
+                setResult(r.data);
+              } catch (err) {
+                console.error('Predict from converse failed', err);
+              }
+            }
+
+            // Speak reply
+            fetchAndPlay(reply);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Audio handling failed', err);
+    }
+    finally {
+      setProcessingSTT(false);
+    }
+  };
+
+  const confirmPending = () => {
+    if (!pendingAction) return;
+    const { convo, reply } = pendingAction;
+    const field = convo.field;
+    const value = convo.value;
+    if (field) setFormData(prev => ({ ...prev, [field]: Number(value) }));
+    setConversation(prev => [...prev, { speaker: 'system', text: `Action applied: ${reply}` }]);
+    fetchAndPlay(`Action applied: ${reply}`);
+    setPendingAction(null);
+  };
+
+  const cancelPending = () => {
+    if (!pendingAction) return;
+    setConversation(prev => [...prev, { speaker: 'system', text: 'Action canceled.' }]);
+    fetchAndPlay('Action canceled.');
+    setPendingAction(null);
   };
 
   const handleInputChange = (field, value) => {
@@ -120,7 +286,7 @@ function App() {
     setError(null);
   };
 
-  const navItems = [
+  const initialNav = [
     { icon: LayoutDashboard, key: 'dashboard', active: true },
     { icon: Activity, key: 'sakhi_ai', active: false },
     { icon: Wallet, key: 'accounts', active: false },
@@ -130,6 +296,8 @@ function App() {
     { icon: CreditCard, key: 'loans', active: false },
     { icon: Settings, key: 'settings', active: false },
   ];
+
+  const [navItems, setNavItems] = useState(initialNav);
 
   const LOCALES = {
     en: {
@@ -608,6 +776,14 @@ function App() {
                 {ttsEnabled ? translate('voice_on') : translate('voice_off')}
               </button>
 
+              {/* Speech-to-Text (Push-to-talk) */}
+              <button
+                onClick={() => (recording ? stopRecording() : startRecording())}
+                className={`ml-2 px-3 py-2 rounded-xl border ${recording ? 'bg-red-500 text-white' : 'text-slate-300'}`}
+              >
+                {recording ? 'Stop' : 'Talk'}
+              </button>
+
               {/* Add Widget Button */}
               <button className="bg-gradient-to-r from-blue-600 to-purple-600 px-4 py-2 rounded-xl flex items-center gap-2 hover-lift">
                 <span className="text-sm font-semibold text-white">{translate('add_new_widget')}</span>
@@ -618,6 +794,34 @@ function App() {
 
         {/* Dashboard Content */}
         <div className="p-8">
+          {/* Conversation Panel */}
+          <div className="fixed right-6 top-24 w-80 max-h-96 overflow-auto glass rounded-xl p-3 text-sm z-50">
+            {conversation.length === 0 ? (
+              <p className="text-slate-400 text-xs">Conversation will appear here</p>
+            ) : (
+              conversation.map((m, i) => (
+                <div key={i} className={`mb-2 ${m.speaker === 'user' ? 'text-white' : 'text-slate-300'}`}>
+                  <div className="font-semibold text-xs uppercase">{m.speaker}</div>
+                  <div className="mt-1">{m.text}</div>
+                </div>
+              ))
+            )}
+
+            {processingSTT && (
+              <div className="mt-2 text-xs text-amber-300">Processing speech... ⏳</div>
+            )}
+
+            {detectedLang && (
+              <div className="mt-2 text-xs text-slate-400">Detected language: {detectedLang}</div>
+            )}
+
+            {pendingAction && (
+              <div className="mt-3 flex gap-2">
+                <button onClick={confirmPending} className="px-3 py-1 bg-emerald-500 text-white rounded">Confirm</button>
+                <button onClick={cancelPending} className="px-3 py-1 bg-red-500 text-white rounded">Cancel</button>
+              </div>
+            )}
+          </div>
           {/* Top Stats Row */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
             {/* AI Insights Card */}

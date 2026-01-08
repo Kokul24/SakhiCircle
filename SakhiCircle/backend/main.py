@@ -16,13 +16,34 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server
 import matplotlib.pyplot as plt
 import shap
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from langdetect import detect as lang_detect
+from word2number import w2n
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 from gtts import gTTS
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+# Prefer faster-whisper if available for lower latency
+try:
+    from faster_whisper import WhisperModel as FasterWhisperModel
+    _HAS_FASTER_WHISPER = True
+except Exception:
+    FasterWhisperModel = None
+    _HAS_FASTER_WHISPER = False
+
+try:
+    import whisper
+    _HAS_OPENAI_WHISPER = True
+except Exception:
+    whisper = None
+    _HAS_OPENAI_WHISPER = False
 
 # ============================================================
 # FastAPI App Initialization
@@ -78,6 +99,8 @@ def connect_to_mongodb():
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'shg_model.pkl')
 model = None
 explainer = None
+whisper_model = None
+whisper_backend = None  # 'faster' or 'openai'
 
 def load_model():
     """Load the trained RandomForest model and initialize SHAP explainer."""
@@ -99,6 +122,53 @@ def load_model():
     except Exception as e:
         print(f"❌ Error loading model: {e}")
         return False
+
+
+def load_whisper_model():
+    """Load Whisper model for offline speech-to-text with configurable options.
+
+    Prefers `faster-whisper` when available and will attempt to use an
+    int8 compute type for lower CPU latency. Configure with env vars:
+    - WHISPER_MODEL (default: 'small')
+    - WHISPER_DEVICE (default: 'cpu')
+    - WHISPER_COMPUTE (optional: e.g. 'int8_float32')
+    """
+    global whisper_model, whisper_backend
+    model_name = os.getenv('WHISPER_MODEL', 'small')
+    device = os.getenv('WHISPER_DEVICE', 'cpu')
+    compute = os.getenv('WHISPER_COMPUTE', 'int8_float32')
+
+    # Try faster-whisper first (preferred for CPU speedups)
+    if _HAS_FASTER_WHISPER:
+        try:
+            print(f"➡️ Attempting faster-whisper load: model={model_name}, device={device}, compute={compute}")
+            # Some compute types may not be available; try with compute then fallback
+            try:
+                whisper_model = FasterWhisperModel(model_name, device=device, compute_type=compute)
+            except TypeError:
+                # Older faster-whisper variations may not accept compute_type
+                whisper_model = FasterWhisperModel(model_name, device=device)
+
+            whisper_backend = 'faster'
+            print(f"✅ faster-whisper model loaded successfully ({model_name})")
+            return True
+        except Exception as e:
+            print(f"⚠️ faster-whisper load failed: {e}")
+
+    # Fallback to OpenAI whisper
+    if _HAS_OPENAI_WHISPER:
+        try:
+            print(f"➡️ Attempting OpenAI Whisper load: model={model_name}")
+            whisper_model = whisper.load_model(model_name)
+            whisper_backend = 'openai'
+            print(f"✅ OpenAI Whisper model loaded successfully ({model_name})")
+            return True
+        except Exception as e:
+            print(f"⚠️ OpenAI Whisper load failed: {e}")
+
+    whisper_model = None
+    whisper_backend = None
+    return False
 
 # ============================================================
 # Pydantic Models
@@ -227,6 +297,7 @@ async def startup_event():
     
     connect_to_mongodb()
     load_model()
+    load_whisper_model()
     
     print("=" * 50)
     print("✅ API Ready at http://localhost:8000")
@@ -334,6 +405,340 @@ async def get_prediction_logs(limit: int = 10):
         return {"logs": logs, "count": len(logs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/stt')
+async def stt_endpoint(file: UploadFile = File(...), lang: str = Form('auto')):
+    """Accept an audio upload (multipart/form-data) and return transcription using Whisper.
+
+    - If `lang` is `'auto'` (default), allow the model to auto-detect language.
+    - Return `detected_lang` alongside the transcript for frontend UX.
+    """
+    if whisper_model is None:
+        raise HTTPException(status_code=503, detail="Speech model not loaded")
+
+    start = time.time()
+    try:
+        suffix = Path(file.filename).suffix if file.filename else '.wav'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        print(f"🔊 Received audio file {file.filename} -> {tmp_path} (lang={lang}, size={len(content)})")
+
+        # Decide whether to pass a language hint or let the model auto-detect
+        lang_hint = None if (not lang or lang == 'auto') else lang
+
+        # Basic Voice Activity Detection (VAD) filter: drop too-silent uploads
+        try:
+            import audioop
+            rms = audioop.rms(content, 2) if len(content) > 0 else 0
+            print(f"🔍 Audio RMS: {rms}")
+            if rms < 300:  # threshold tuned for 16-bit audio; may need adjustments
+                print("⚠️ Audio too silent — skipping STT")
+                return {'text': '', 'detected_lang': None, 'duration_ms': int((time.time()-start)*1000), 'note': 'audio too silent'}
+        except Exception:
+            pass
+
+        text = ''
+        detected_lang = None
+
+        # Prefer faster backend when available
+        if whisper_backend == 'faster' and whisper_model is not None:
+            try:
+                segments, info = whisper_model.transcribe(tmp_path, language=lang_hint)
+                text = ' '.join([s.text for s in segments]).strip()
+                detected_lang = getattr(info, 'language', None)
+                print(f"📝 faster-whisper transcription: '{text}' (detected_lang={detected_lang})")
+            except Exception as e:
+                print(f"⚠️ faster-whisper transcription error: {e}. Trying fallback...")
+                # fallback attempt with no language hint
+                try:
+                    segments, info = whisper_model.transcribe(tmp_path, language=None)
+                    text = ' '.join([s.text for s in segments]).strip()
+                    detected_lang = getattr(info, 'language', None)
+                    print(f"📝 faster-whisper fallback transcription: '{text}' (detected_lang={detected_lang})")
+                except Exception as e2:
+                    print(f"❌ faster-whisper fallback failed: {e2}")
+                    raise
+
+        elif whisper_backend == 'openai' and whisper_model is not None:
+            try:
+                result = whisper_model.transcribe(tmp_path, language=lang_hint)
+                text = result.get('text', '').strip()
+                detected_lang = result.get('language', None)
+                print(f"📝 OpenAI Whisper transcription: '{text}' (detected_lang={detected_lang})")
+            except Exception as e:
+                print(f"⚠️ OpenAI Whisper transcription error: {e}")
+                raise
+        else:
+            raise RuntimeError('No speech model available')
+
+        # Basic normalization and cleanup for multilingual robustness
+        try:
+            text = unicodedata.normalize('NFKC', text).strip()
+            text = ' '.join(text.split())
+        except Exception:
+            pass
+
+        # If text looks empty but we had a lang hint 'auto', try statistical detection
+        if (not text or len(text) < 2) and lang in (None, '', 'auto'):
+            try:
+                # Attempt to guess language from raw audio filename or other heuristics
+                guessed = None
+                # fallback: try language detect on any existing textual metadata
+                guessed = None
+                if guessed:
+                    detected_lang = guessed
+                else:
+                    # Try to see if model returned a language attribute earlier
+                    detected_lang = detected_lang or None
+            except Exception:
+                pass
+
+        # Parse spoken numbers into numeric values when set_field intents are used
+        # This is left to the `/converse` parsing which can call w2n when needed.
+
+        duration_ms = int((time.time() - start) * 1000)
+        return { 'text': text, 'detected_lang': detected_lang, 'duration_ms': duration_ms }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT failed: {e}")
+
+
+@app.post('/converse')
+async def converse_endpoint(text: str = Form(...), lang: str = Form('en'),
+                            savings: float = Form(None), attendance: float = Form(None), repayment: float = Form(None)):
+    """Simple conversational handler: recognizes 'calculate' intent and returns localized reply."""
+    t = (text or '').lower()
+
+    # Minimal keywords per language for 'calculate'
+    calculate_keywords = {
+        'en': ['calculate', 'score', 'compute'],
+        'hi': ['स्कोर', 'गणना', 'स्कोर निकाल'],
+        'bn': ['স্কোর', 'হিসাব', 'গণনা'],
+        'ta': ['மதிப்பீடு', 'கணக்கிட', 'ஸ்கோர்'],
+        'kn': ['ಸ್ಕೋರ್', 'ಗಣನೆ', 'ಲೆಕ್ಕ'],
+        'te': ['స్కోర్', 'గణన', 'లెక్క'],
+        'ml': ['സ്കോർ', 'ਲెక్క', 'ഗണിക്ക'],
+        'mr': ['स्कोर', 'गणना', 'हिशेब'],
+        'gu': ['સ્કોર', 'ગણતરી', 'હિસાબ'],
+        'pa': ['ਸਕੋਰ', 'ਗਣਨਾ', 'ਹਿਸਾਬ']
+    }
+
+    # Localized reply templates
+    TEMPLATES = {
+        'en': "Your credit score is {score}. Risk: {risk}.",
+        'hi': "आपका क्रेडिट स्कोर {score} है। जोखिम: {risk}।",
+        'bn': "আপনার ক্রেডিট স্কোর {score}। ঝুঁকি: {risk}",
+        'ta': "உங்கள் கடன் மதிப்பெண் {score}. அபாயம்: {risk}",
+        'kn': "ನಿಮ್ಮ ಕ್ರೆಡಿಟ್ ಸ್ಕೋರ್ {score}. ಅಪಾಯ: {risk}",
+        'te': "మీ క్రెడిట్ స్కోరు {score}. ప్రమాదం: {risk}",
+        'ml': "നിങ്ങളുടെ ക്രെഡിറ്റ് സ്കോർ {score}. റിസ്‌ക്: {risk}",
+        'mr': "आपला क्रेडिट स्कोअर {score}. जोखम: {risk}",
+        'gu': "તમારો ક્રેડિટ સ્કોર {score}. જોખમ: {risk}",
+        'pa': "ਤੁਹਾਡਾ ਕ੍ਰੈਡਿਟ ਸਕੋਰ {score}. ਜੋਖਮ: {risk}"
+    }
+
+    # If caller asked for 'auto' or sent unknown lang, try to detect from text
+    if not lang or lang == 'auto' or lang not in calculate_keywords:
+        try:
+            detected = lang_detect(text or '')
+            detected_short = detected[:2]
+            if detected_short in calculate_keywords:
+                lang = detected_short
+                print(f"🔤 converse: auto-detected language -> {lang}")
+        except Exception:
+            lang = 'en'
+
+    # detect calculate intent
+    intent_calculate = any(k in t for k in calculate_keywords.get(lang, []))
+
+    if intent_calculate:
+        # Use provided metrics if any, else defaults
+        s = float(savings) if savings is not None else 2500.0
+        a = float(attendance) if attendance is not None else 85.0
+        r = float(repayment) if repayment is not None else 75.0
+
+        score = calculate_credit_score(s, a, r)
+        risk_status = "Low Risk" if score >= 60 else "High Risk"
+
+        # Localize risk label
+        risk_local = {
+            'en': 'Low Risk' if score >= 60 else 'High Risk',
+            'hi': 'कम जोखिम' if score >= 60 else 'उच्च जोखिम',
+            'bn': 'কম ঝুঁকি' if score >= 60 else 'উচ্চ ঝুঁকি',
+            'ta': 'குறைந்த அபாயம்' if score >= 60 else 'உயர்ந்த அபாயம்',
+            'kn': 'ಕಡಿಮೆ ಅಪಾಯ' if score >= 60 else 'ಅಧಿಕ ಅಪಾಯ',
+            'te': 'తక్కువ ప్రమాదం' if score >= 60 else 'అధిక ప్రమాదం',
+            'ml': 'കുറഞ്ഞ ঝൂթի' if score >= 60 else 'ഉയർന്ന റിസ്‌ക്',
+            'mr': 'कमी जोखीम' if score >= 60 else 'जास्त जोखीम',
+            'gu': 'ઓછો જોખમ' if score >= 60 else 'ઉચ્ચ જોખમ',
+            'pa': 'ਘੱਟ ਜੋਖਮ' if score >= 60 else 'ਉੱਚ ਜੋਖਮ'
+        }.get(lang, 'Low Risk' if score >= 60 else 'High Risk')
+
+        template = TEMPLATES.get(lang, TEMPLATES['en'])
+        reply = template.format(score=score, risk=risk_local)
+
+        return { 'action': 'predict', 'score': score, 'reply': reply }
+
+    # Fallback: echo
+    # Try to detect "set <field> to <value>" commands
+    # Field keywords per language
+    field_keywords = {
+        'en': {
+            'savings': ['savings', 'monthly savings', 'monthly saving', 'save', 'monthly contribution', 'per member'],
+            'attendance': ['attendance', 'meeting attendance', 'presence', 'attendance rate', 'meeting turnout'],
+            'repayment': ['repayment', 'repay', 'repayment rate', 'loan repayment', 'on-time repayment', 'emi']
+        },
+        'hi': {
+            'savings': ['बचत', 'बचत प्रति सदस्य', 'मासिक बचत', 'मासिक योगदान', 'प्रति सदस्य'],
+            'attendance': ['उपस्थिति', 'हाजिरी', 'हाजिरी दर', 'बैठक उपस्थिति', 'उपस्थित प्रतिशत'],
+            'repayment': ['भुगतान', 'वापसी', 'ऋण भुगतान', 'समय पर भुगतान', 'कर्ज चुकौती']
+        },
+        'bn': {
+            'savings': ['সঞ্চয়', 'মাসিক সঞ্চয়', 'প্রতি সদস্য'],
+            'attendance': ['উপস্থিতি', 'মিটিং উপস্থিতি', 'উপস্থিতির হার'],
+            'repayment': ['প্রত্যর্পণ', 'প্রতিদান', 'ঋণ পরিশোধ']
+        },
+        'ta': {
+            'savings': ['சேமிப்பு', 'மாத சேமிப்பு', 'ஒரு உறுப்பினருக்கு'],
+            'attendance': ['வருகை', 'ஒட்டுமொத்த வருகை', 'கூட்டத்தில் வருகை'],
+            'repayment': ['திருப்பி', 'கட்டணம்', 'கடன்செலுத்தல்']
+        },
+        'te': {
+            'savings': ['సేవింగ్స్', 'మాసిక సేవింగ్స్', 'ప్రతి సభ్యుడు'],
+            'attendance': ['హాజరు', 'సభ హాజరు', 'హాజరీ రేటు'],
+            'repayment': ['చెల్లింపు', 'తిరిగి చెల్లింపు', 'ఋణ చెల్లింపు']
+        },
+        'kn': {
+            'savings': ['ಉಳವೊ', 'ಸಂಚಯ', 'ಮಾಸಿಕ ಉಳವೆ', 'ಪ್ರತಿ ಸದಸ್ಯ'],
+            'attendance': ['ಹಾಜರಿ', 'ಸಭೆ ಹಾಜರಿ', 'ಹಾಜರಿ ದರ', 'ೂಪಸ್ಥಿತಿ'],
+            'repayment': ['ಮರುಪಾವತಿ', 'ಬಡ್ಡಿ ಪಾವತಿ', 'ಕಡ್ಡಿ']
+        },
+        'ml': {
+            'savings': ['ശേഖരം', 'മാസ്റ്റ്രി ശേഖരം', 'പ്രതി അംഗം'],
+            'attendance': ['ഹാജര', 'യോഗ ഹാജര', 'ഹാജര നിരക്ക്'],
+            'repayment': ['തിരിച്ചു അടുപ്പ്', 'കിട്ട്പാട്', 'പണമടയ്‌ക്കല്']
+        },
+        'mr': {
+            'savings': ['बचत', 'मासिक बचत', 'प्रति सदस्य'],
+            'attendance': ['हजेरी', 'बैठकीची हजेरी', 'हजेरी दर'],
+            'repayment': ['परतफेड', 'कर्ज परतफेड', 'वेळेवर परतफेड']
+        },
+        'gu': {
+            'savings': ['બચત', 'માસિક બચત', 'પ્રતિ સભ્ય'],
+            'attendance': ['હાજરી', 'બેઠક હાજરી', 'હાજરી દર'],
+            'repayment': ['ચુકવણી', 'રીપેમેન્ટ', 'સમીય પર ચૂકવણી']
+        },
+        'pa': {
+            'savings': ['ਬਚਤ', 'ਮਹੀਨਾਵਾਰ ਬਚਤ', 'ਹਰ ਮੈਂਬਰ'],
+            'attendance': ['ਹਾਜ਼ਰੀ', 'ਮੀਟਿੰਗ ਹਾਜ਼ਰੀ', 'ਹਾਜ਼ਰੀ ਦਰ'],
+            'repayment': ['ਵਾਪਸੀ', 'ਕਰਜ਼ ਵਾਪਸੀ', 'ਸਮੇਂ ']
+        }
+    }
+
+    # Ensure language mapping exists (fallback to en)
+    fk = field_keywords.get(lang, field_keywords['en'])
+
+    # Find a number in the text: prefer explicit digits
+    import re
+    num_match = re.search(r"(\d{1,7}(?:[\.,]\d+)?)", text)
+    value = None
+    if num_match:
+        value_raw = num_match.group(1)
+        try:
+            value = float(value_raw.replace(',', '')) if ('.' in value_raw or ',' in value_raw) else int(value_raw.replace(',', ''))
+        except Exception:
+            value = value_raw
+
+    lowered = t
+    # If no digits found and language is English, try parsing number words
+    if value is None and (lang.startswith('en') or lang == 'en'):
+        try:
+            # Attempt to extract phrase after known field keyword
+            for field, kwlist in fk.items():
+                for kw in kwlist:
+                    if kw in lowered:
+                        cand = lowered.split(kw)[-1]
+                        # Keep only words and spaces
+                        cand_words = re.sub(r"[^a-zA-Z\s-]", ' ', cand).strip()
+                        if cand_words:
+                            try:
+                                parsed = w2n.word_to_num(cand_words)
+                                value = parsed
+                                break
+                            except Exception:
+                                continue
+                if value is not None:
+                    break
+        except Exception:
+            value = None
+
+    if value is not None:
+        # look for which field
+        for field, kwlist in fk.items():
+            if any(kw in lowered for kw in kwlist):
+                # Compose a localized reply
+                replies = {
+                    'en': f'Set {field} to {value}.',
+                    'hi': f'{field} को {value} पर सेट कर दिया गया है।',
+                    'bn': f'{field} {value} এ সেট করা হয়েছে।'
+                }
+                reply = replies.get(lang, replies['en'])
+                return { 'action': 'set_field', 'field': field, 'value': value, 'reply': reply }
+
+    # Navigation intents per language
+    nav_keywords = {
+        'en': {
+            'dashboard': ['dashboard', 'home'],
+            'accounts': ['account', 'accounts'],
+            'transactions': ['transaction', 'transactions'],
+            'reports': ['report', 'reports'],
+            'investments': ['investment', 'investments'],
+            'loans': ['loan', 'loans'],
+            'settings': ['setting', 'settings'],
+            'sakhi_ai': ['sakhi ai', 'sakhi']
+        },
+        'hi': {
+            'dashboard': ['डैशबोर्ड', 'होम'],
+            'accounts': ['खाते'],
+            'transactions': ['लेन', 'लेन-देन'],
+            'reports': ['रिपोर्ट'],
+            'investments': ['निवेश'],
+            'loans': ['ऋण'],
+            'settings': ['सेटिंग'],
+            'sakhi_ai': ['सखी']
+        }
+    }
+
+    # show logs intent keywords
+    logs_keywords = {
+        'en': ['logs', 'show logs', 'prediction logs', 'history'],
+        'hi': ['लॉग', 'लॉग दिखाएँ', 'इतिहास']
+    }
+
+    # detect navigation
+    nk = nav_keywords.get(lang, nav_keywords['en'])
+    for target, words in nk.items():
+        if any(w in t for w in words):
+            replies_nav = {
+                'en': f'Navigating to {target}.',
+                'hi': f'{target} पर जा रहे हैं।'
+            }
+            return { 'action': 'navigate', 'target': target, 'reply': replies_nav.get(lang, replies_nav['en']) }
+
+    # detect logs request
+    lk = logs_keywords.get(lang, logs_keywords['en'])
+    if any(w in t for w in lk):
+        replies_logs = {
+            'en': 'Fetching recent logs for you.',
+            'hi': 'नवीनतम लॉग निकाल रहा हूँ।'
+        }
+        return { 'action': 'show_logs', 'reply': replies_logs.get(lang, replies_logs['en']) }
+
+    return { 'action': 'echo', 'reply': f"I heard: {text}" }
 
 
 @app.post("/tts")
