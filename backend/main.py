@@ -46,7 +46,9 @@ app = FastAPI(
 # CORS Configuration - Allow all origins for hackathon demo
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://sakhi-circle-zeta.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
