@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: sakhicircle-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENABLE_DEFAULT_USERS=true
+      - MONGO_URI=mongodb+srv://kokulkrishnan07_db_user:GjivqglXwk2XWWZP@streesquad.6v6zwht.mongodb.net/?appName=Streesquad
+      - DB_NAME=sakhiscore
+    restart: unless-stopped
+    working_dir: /app
+  frontend:
+    build:
+      context: ./frontend
+    container_name: sakhicircle-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

@@ -1,0 +1,29 @@
+# .gitignore for SakhiCircle
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.env
+venv/
+.venv/
+
+# Node
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Docker
+*.tar
+
+# Sensitive files
+SakhiCircle/backend/.env
+SakhiCircle/frontend/.env
