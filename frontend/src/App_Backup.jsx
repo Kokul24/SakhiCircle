@@ -31,7 +31,7 @@ import FormInput from './components/FormInput';
 import ScoreCard from './components/ScoreCard';
 import jsPDF from 'jspdf';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = (window.ENV && window.ENV.API_URL) ? window.ENV.API_URL : 'http://localhost:8000';
 
 // ==================== LANDING PAGE ====================
 function LandingPage({ onRoleSelect }) {
